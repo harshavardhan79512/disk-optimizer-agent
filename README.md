@@ -11,7 +11,7 @@ Ollama model selects an MCP tool
         ↓
 MCP server runs df, du, or stat
         ↓
-LLM selects matching files and totals their sizes
+MCP usage tool returns the matching files and exact total
         ↓
 Host shows the exact selection and asks for approval
         ↓
@@ -23,11 +23,11 @@ MCP delete_files removes approved files and the host verifies
 | Tool | Linux utility | Purpose |
 | --- | --- | --- |
 | `get_disk_stats` | `df` | Reports filesystem capacity and available space. |
-| `get_directory_usage` | `du` | Lists file paths and byte sizes for the allowed demo folder. |
+| `get_directory_usage` | `du`, `stat` | Filters files by age or extension and returns exact sizes and the combined total. |
 | `get_file_metadata` | `stat` | Reports file size, modification time, and type. |
 | `delete_files` | Python file operation | Removes selected files after the host obtains user approval. |
 
-The LLM uses disk usage and metadata results to apply the user's age, size, and location constraints and calculate the candidate total.
+The LLM interprets the user's request and selects the appropriate tool and filters. The host passes explicit age and extension constraints to `get_directory_usage`; the tool returns matching paths and the exact total, avoiding model guesses about timestamps or arithmetic.
 
 ## Safety
 
@@ -41,7 +41,7 @@ The LLM uses disk usage and metadata results to apply the user's age, size, and 
 
 - Linux with `df`, `du`, and `stat`
 - Python 3.11 or newer
-- Ollama with the `qwen3:0.6b` model
+- Ollama with the `qwen3:1.7b` model
 
 ## Install and prepare the demo
 
@@ -51,9 +51,15 @@ From the project folder in Ubuntu:
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-ollama pull qwen3:0.6b
+ollama pull qwen3:1.7b
 mkdir -p "$HOME/Downloads/disk_optimizer_demo"
 python3 agentic_shell.py --setup-demo
+```
+
+Set the model before starting the demo:
+
+```bash
+export OLLAMA_MODEL=qwen3:1.7b
 ```
 
 If Ollama is not already running, start it in a separate terminal with `ollama serve`.

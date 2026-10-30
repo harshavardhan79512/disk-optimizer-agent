@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 from mcp.server import MCPServer
@@ -59,17 +60,20 @@ def get_disk_stats() -> str:
 
 
 @SERVER.tool()
-def get_directory_usage(relative_directory: str = ".") -> str:
-    """Use du to list file sizes under a relative directory in the demo folder.
+def get_directory_usage(older_than_days: int = 0, extension: str = "") -> str:
+    """Use du and stat to return files matching age and extension filters.
 
-    Returns JSON containing relative file paths and byte sizes. The LLM can use
-    these results together with get_file_metadata to apply the user's constraints.
+    Returns JSON with relative paths, exact byte sizes, ages, and a combined total.
+    The allowed directory is fixed; do not pass an absolute path.
     """
     _require_root()
-    if relative_directory in {"", "."}:
-        directory = ROOT
-    else:
-        directory = _safe_path(relative_directory, must_be_file=False)
+    if older_than_days < 0:
+        return json.dumps({"error": "older_than_days must be zero or greater."})
+    extension = extension.strip().lower()
+    if extension and not extension.startswith("."):
+        extension = "." + extension
+
+    directory = ROOT
 
     result = subprocess.run(
         ["du", "-a", "-B1", "--null", "--", str(directory)],
@@ -79,6 +83,7 @@ def get_directory_usage(relative_directory: str = ".") -> str:
     )
 
     files = []
+    now = time.time()
     for record in result.stdout.split("\0"):
         if not record:
             continue
@@ -86,15 +91,35 @@ def get_directory_usage(relative_directory: str = ".") -> str:
         path = Path(absolute_name)
         if path.is_symlink() or not path.is_file():
             continue
+        if extension and path.suffix.lower() != extension:
+            continue
+        stat_result = subprocess.run(
+            ["stat", "--format=%Y", "--", str(path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        modified_epoch = int(stat_result.stdout.strip())
+        age_days = max(0, int((now - modified_epoch) // 86400))
+        if older_than_days and age_days < older_than_days:
+            continue
         files.append(
             {
                 "path": path.relative_to(ROOT).as_posix(),
                 "size_bytes": int(size_text),
+                "age_days": age_days,
             }
         )
 
     files.sort(key=lambda item: item["size_bytes"], reverse=True)
-    return json.dumps(files, indent=2)
+    return json.dumps(
+        {
+            "filters": {"older_than_days": older_than_days, "extension": extension},
+            "candidates": files,
+            "total_bytes": sum(item["size_bytes"] for item in files),
+        },
+        indent=2,
+    )
 
 
 @SERVER.tool()

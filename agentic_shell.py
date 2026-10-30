@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -27,10 +28,13 @@ DEMO_FOLDER = Path(
 SYSTEM_PROMPT = f"""You are the Disk Quota & Space Optimizer specialist inside an Agentic Shell.
 The MCP server limits all file access to: {DEMO_FOLDER}
 Use the registered MCP tools to inspect disk space and files. Never invent tool
-results or execute shell commands. For cleanup requests, inspect usage and file
-metadata, apply the user's age, size, and location constraints, and calculate the
-total candidate size. Only call delete_files when the user requested deletion;
+results or execute shell commands. For cleanup requests, call get_directory_usage
+with age and extension filters; it returns the matching paths and exact combined
+size. Use get_file_metadata to inspect selected files. Only call delete_files when the user requested deletion;
 the host will show the exact paths and ask for approval before executing it.
+The allowed folder is fixed; do not pass directory paths to get_directory_usage.
+Use only relative file paths returned by the tools when calling get_file_metadata
+or delete_files. Do not pass the absolute allowed-folder path to any tool.
 If the user declines, do not retry deletion. Report only results returned by tools.
 """
 
@@ -42,8 +46,9 @@ def setup_demo_files() -> None:
     current_file = DEMO_FOLDER / "meeting_notes.txt"
     if not old_file.exists():
         old_file.write_text("Sample old file for the demo.\n" * 100, encoding="utf-8")
-        old_time = time.time() - (45 * 86400)
-        os.utime(old_file, (old_time, old_time))
+    # Reset the demo timestamp on every setup run so the age filter is repeatable.
+    old_time = time.time() - (45 * 86400)
+    os.utime(old_file, (old_time, old_time))
     if not current_file.exists():
         current_file.write_text("Sample current file for the demo.\n" * 40, encoding="utf-8")
     print(f"Created demo samples in: {DEMO_FOLDER}")
@@ -74,6 +79,25 @@ def _result_text(result) -> str:
     return json.dumps(getattr(result, "structured_content", None) or {})
 
 
+def _requested_usage_filters(user_text: str) -> dict:
+    """Extract simple explicit age/extension constraints to validate tool args."""
+    filters = {}
+    age = re.search(
+        r"\b(?:older|more than|over)\s+(?:than\s+)?(\d+)\s+days?\b",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    if age:
+        filters["older_than_days"] = int(age.group(1))
+
+    extension = re.search(r"\.([a-zA-Z0-9]{1,8})\b", user_text)
+    if extension:
+        filters["extension"] = "." + extension.group(1).lower()
+    elif re.search(r"\btext files?\b", user_text, flags=re.IGNORECASE):
+        filters["extension"] = ".txt"
+    return filters
+
+
 async def _delete_after_host_approval(client: Client, arguments: dict) -> str:
     paths = arguments.get("paths", [])
     if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
@@ -83,6 +107,7 @@ async def _delete_after_host_approval(client: Client, arguments: dict) -> str:
 
     previews = []
     for path in dict.fromkeys(paths):
+        print(f"\n[MCP tool] get_file_metadata(relative_path={path!r})")
         result = await client.call_tool("get_file_metadata", {"relative_path": path})
         if getattr(result, "is_error", False):
             return f"Deletion cancelled: could not inspect {path}."
@@ -103,6 +128,7 @@ async def _delete_after_host_approval(client: Client, arguments: dict) -> str:
     if approval != "DELETE":
         return "User declined. No files were deleted."
 
+    print("\n[MCP tool] delete_files(paths=approved selection)")
     result = await client.call_tool(
         "delete_files", {"paths": [item["path"] for item in previews]}
     )
@@ -110,8 +136,9 @@ async def _delete_after_host_approval(client: Client, arguments: dict) -> str:
     if getattr(result, "is_error", False):
         return f"Deletion tool reported an error: {deleted_text}"
 
+    print("[MCP tool] get_directory_usage() - verify remaining files")
     verification = await client.call_tool(
-        "get_directory_usage", {"relative_directory": "."}
+        "get_directory_usage", {}
     )
     return (
         f"Deletion result: {deleted_text}\n"
@@ -166,14 +193,25 @@ async def run_shell() -> None:
 
                     for call in calls:
                         name = call.function.name
-                        arguments = call.function.arguments or {}
+                        arguments = dict(call.function.arguments or {})
+                        print(
+                            f"\n[LLM selected MCP tool] {name}"
+                            f"({json.dumps(arguments, ensure_ascii=False)})"
+                        )
                         if name not in tool_names:
                             tool_output = f"Tool is not available: {name}"
                         elif name == "delete_files":
                             tool_output = await _delete_after_host_approval(client, arguments)
                         else:
+                            if name == "get_directory_usage":
+                                arguments.update(_requested_usage_filters(user_text))
+                                print(
+                                    "[Host applied request filters] "
+                                    f"{json.dumps(arguments, ensure_ascii=False)}"
+                                )
                             result = await client.call_tool(name, arguments)
                             tool_output = _result_text(result)
+                            print(f"[MCP result] {tool_output}")
                             if getattr(result, "is_error", False):
                                 tool_output = f"MCP tool error: {tool_output}"
 
