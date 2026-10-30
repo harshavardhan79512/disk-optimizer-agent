@@ -1,10 +1,10 @@
-"""MCP tools for a safe, demo-folder-only Linux disk optimizer."""
+"""MCP tools for the Disk Quota & Space Optimizer specialist agent."""
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
-import time
 from pathlib import Path
 
 from mcp.server import MCPServer
@@ -19,17 +19,16 @@ ROOT = Path(
 ).expanduser().resolve()
 
 
-def _check_root() -> str | None:
+def _require_root() -> None:
     if not ROOT.is_dir():
-        return f"The allowed demo folder does not exist: {ROOT}"
-    return None
+        raise FileNotFoundError(f"Allowed demo folder does not exist: {ROOT}")
 
 
-def _safe_file(relative_path: str) -> Path:
-    """Resolve one regular file while rejecting traversal and symlinks."""
+def _safe_path(relative_path: str, *, must_be_file: bool) -> Path:
+    """Resolve a relative path while rejecting traversal and symbolic links."""
     relative = Path(relative_path)
     if relative.is_absolute() or not relative.parts or ".." in relative.parts:
-        raise ValueError("Provide a relative file path inside the allowed folder.")
+        raise ValueError("Use a relative path inside the allowed demo folder.")
 
     candidate = ROOT
     for part in relative.parts:
@@ -39,19 +38,19 @@ def _safe_file(relative_path: str) -> Path:
 
     resolved = candidate.resolve(strict=True)
     resolved.relative_to(ROOT)
-    if not resolved.is_file():
+    if must_be_file and not resolved.is_file():
         raise ValueError("The selected path is not a regular file.")
+    if not must_be_file and not resolved.is_dir():
+        raise ValueError("The selected path is not a directory.")
     return resolved
 
 
 @SERVER.tool()
-def get_disk_space() -> str:
-    """Check total and available disk space for the allowed demo folder using df."""
-    problem = _check_root()
-    if problem:
-        return problem
+def get_disk_stats() -> str:
+    """Use df to report total, used, and available space for the demo filesystem."""
+    _require_root()
     result = subprocess.run(
-        ["df", "-h", "--", str(ROOT)],
+        ["df", "-P", "-B1", "--", str(ROOT)],
         capture_output=True,
         text=True,
         check=True,
@@ -60,132 +59,95 @@ def get_disk_space() -> str:
 
 
 @SERVER.tool()
-def get_folder_usage() -> str:
-    """Check the total size of the allowed demo folder using du."""
-    problem = _check_root()
-    if problem:
-        return problem
-    result = subprocess.run(
-        ["du", "-sh", "--", str(ROOT)],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return result.stdout.strip()
+def get_directory_usage(relative_directory: str = ".") -> str:
+    """Use du to list file sizes under a relative directory in the demo folder.
 
-
-@SERVER.tool()
-def list_candidates(
-    extension: str = "",
-    older_than_days: int = 0,
-    largest_first: bool = True,
-    limit: int = 30,
-) -> str:
-    """List files in the demo folder, optionally filtering by extension or age.
-
-    File sizes are measured with du. Returned paths are relative to the demo folder.
+    Returns JSON containing relative file paths and byte sizes. The LLM can use
+    these results together with get_file_metadata to apply the user's constraints.
     """
-    problem = _check_root()
-    if problem:
-        return problem
-    if older_than_days < 0:
-        return "older_than_days must be zero or greater."
-
-    extension = extension.strip().lower()
-    if extension and not extension.startswith("."):
-        extension = "." + extension
-    maximum = max(1, min(limit, 100))
-    cutoff = time.time() - older_than_days * 86400
-    candidates: list[tuple[int, str]] = []
-
-    for folder, directories, filenames in os.walk(ROOT, followlinks=False):
-        current = Path(folder)
-        directories[:] = [
-            name for name in directories if not (current / name).is_symlink()
-        ]
-
-        for filename in filenames:
-            path = current / filename
-            if path.is_symlink() or (extension and path.suffix.lower() != extension):
-                continue
-
-            try:
-                if older_than_days and path.stat().st_mtime > cutoff:
-                    continue
-                size_result = subprocess.run(
-                    ["du", "-b", "--", str(path)],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                size_bytes = int(size_result.stdout.split(maxsplit=1)[0])
-                relative = path.relative_to(ROOT).as_posix()
-                candidates.append((size_bytes, relative))
-            except (OSError, ValueError, subprocess.CalledProcessError):
-                continue
-
-    candidates.sort(key=lambda item: item[0], reverse=largest_first)
-    candidates = candidates[:maximum]
-    if not candidates:
-        return "No matching files were found in the allowed demo folder."
-
-    total_bytes = sum(size for size, _ in candidates)
-    lines = [f"Candidates (combined size: {total_bytes:,} bytes):"]
-    lines.extend(f"{size:,} bytes | {name}" for size, name in candidates)
-    return "\n".join(lines)
-
-
-@SERVER.tool()
-def get_file_details(relative_path: str) -> str:
-    """Show file metadata with stat for a relative path in the allowed folder."""
-    try:
-        path = _safe_file(relative_path)
-    except (ValueError, OSError) as error:
-        return f"Could not inspect file: {error}"
+    _require_root()
+    if relative_directory in {"", "."}:
+        directory = ROOT
+    else:
+        directory = _safe_path(relative_directory, must_be_file=False)
 
     result = subprocess.run(
-        ["stat", "--format=Name: %n\nSize: %s bytes\nModified: %y\nPermissions: %A", "--", str(path)],
+        ["du", "-a", "-B1", "--null", "--", str(directory)],
         capture_output=True,
         text=True,
         check=True,
     )
-    return result.stdout.strip()
 
-
-@SERVER.tool()
-def delete_files(relative_paths: list[str], approved: bool = False) -> str:
-    """Delete selected files only after the MCP host has obtained user approval.
-
-    The MCP host must show the exact paths to the user and set approved=true only
-    after the user explicitly confirms. Only regular files inside the demo folder
-    can be removed; directories and symbolic links are rejected.
-    """
-    problem = _check_root()
-    if problem:
-        return problem
-    if not approved:
-        return (
-            "No files were deleted. Show the exact paths to the user and obtain "
-            "explicit approval before calling again with approved=true."
+    files = []
+    for record in result.stdout.split("\0"):
+        if not record:
+            continue
+        size_text, absolute_name = record.split("\t", 1)
+        path = Path(absolute_name)
+        if path.is_symlink() or not path.is_file():
+            continue
+        files.append(
+            {
+                "path": path.relative_to(ROOT).as_posix(),
+                "size_bytes": int(size_text),
+            }
         )
-    if not relative_paths:
-        return "No files were selected."
-    if len(relative_paths) > 20:
-        return "Select no more than 20 files per deletion request."
+
+    files.sort(key=lambda item: item["size_bytes"], reverse=True)
+    return json.dumps(files, indent=2)
+
+
+@SERVER.tool()
+def get_file_metadata(relative_path: str) -> str:
+    """Use stat to report a file's size, modification time, and type."""
+    try:
+        path = _safe_path(relative_path, must_be_file=True)
+    except (ValueError, OSError) as error:
+        return json.dumps({"error": str(error)})
+
+    result = subprocess.run(
+        ["stat", r"--printf=%n\0%s\0%Y\0%F\0", "--", str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    fields = result.stdout.split("\0")
+    return json.dumps(
+        {
+            "path": path.relative_to(ROOT).as_posix(),
+            "size_bytes": int(fields[1]),
+            "modified_epoch": int(fields[2]),
+            "file_type": fields[3],
+        }
+    )
+
+
+@SERVER.tool()
+def delete_files(paths: list[str]) -> str:
+    """Delete only the relative file paths approved by the MCP host's user.
+
+    The trusted host must show the exact paths and obtain user approval before
+    calling this tool. The server independently restricts deletion to regular,
+    non-symlink files inside the configured demo folder.
+    """
+    _require_root()
+    if not paths:
+        return json.dumps({"deleted": [], "message": "No files were selected."})
+    if len(paths) > 20:
+        return json.dumps({"error": "Select no more than 20 files at a time."})
 
     try:
-        paths = [_safe_file(name) for name in dict.fromkeys(relative_paths)]
+        checked = [_safe_path(name, must_be_file=True) for name in dict.fromkeys(paths)]
     except (ValueError, OSError) as error:
-        return f"No files were deleted: {error}"
+        return json.dumps({"error": f"No files were deleted: {error}"})
 
-    deleted: list[str] = []
-    for path in paths:
-        relative = path.relative_to(ROOT).as_posix()
+    deleted = []
+    for path in checked:
+        deleted.append(path.relative_to(ROOT).as_posix())
         path.unlink()
-        deleted.append(relative)
-    return "Deleted after user approval: " + ", ".join(deleted)
+    return json.dumps({"deleted": deleted})
 
 
 if __name__ == "__main__":
-    # MCP local servers use stdio. The MCP host launches this process.
+    # Local MCP hosts launch the server over stdio.
     SERVER.run(transport="stdio")

@@ -1,40 +1,49 @@
 # Disk Quota & Space Optimizer Agent
 
-A Python MCP server for the Disk Quota & Space Optimizer specialist agent. It gives an MCP host safe disk tools to inspect space and candidate files. The larger Agentic Shell is responsible for routing the user's natural-language request to this specialist and for requesting approval before a deletion.
+A Python demonstration of the Disk Optimizer specialist in an Agentic Shell. An Ollama model receives a natural-language request, chooses from the MCP tools, and uses their results to find matching files. Before deletion, the host displays the exact files and asks the user to type `DELETE`.
 
-## How it works
+## Request flow
 
 ```text
-User request → Agentic Shell / LLM → MCP disk tools → Linux utilities → Results
-                                      ↓
-                               User approval → delete_files
+Natural-language request
+        ↓
+Ollama model selects an MCP tool
+        ↓
+MCP server runs df, du, or stat
+        ↓
+LLM selects matching files and totals their sizes
+        ↓
+Host shows the exact selection and asks for approval
+        ↓
+MCP delete_files removes approved files and the host verifies
 ```
 
-## Tools exposed by this server
+## MCP tools
 
-| Tool | Purpose |
-| --- | --- |
-| `get_disk_space` | Uses `df` to report total and available disk space. |
-| `get_folder_usage` | Uses `du` to report the demo folder's total size. |
-| `list_candidates` | Uses `du` to list files, apply age or extension filters, and calculate the combined size. |
-| `get_file_details` | Uses `stat` to report a file's size, modification time, and permissions. |
-| `delete_files` | Deletes selected files only when the MCP host passes `approved=true` after explicit user approval. |
+| Tool | Linux utility | Purpose |
+| --- | --- | --- |
+| `get_disk_stats` | `df` | Reports filesystem capacity and available space. |
+| `get_directory_usage` | `du` | Lists file paths and byte sizes for the allowed demo folder. |
+| `get_file_metadata` | `stat` | Reports file size, modification time, and type. |
+| `delete_files` | Python file operation | Removes selected files after the host obtains user approval. |
 
-## Safety limits
+The LLM uses disk usage and metadata results to apply the user's age, size, and location constraints and calculate the candidate total.
 
-- File tools are restricted to `~/Downloads/disk_optimizer_demo` by default.
-- Set `DISK_OPTIMIZER_ROOT` to choose a different dedicated demo folder.
-- Absolute paths, paths outside the allowed folder, symbolic links, and directories are rejected for deletion.
-- `delete_files` requires the MCP host to show the exact selected paths and obtain user approval first. The host must not set `approved=true` before that approval.
-- The server runs fixed Linux utilities with argument lists; it does not execute arbitrary shell commands from the LLM.
+## Safety
+
+- By default, files are limited to `~/Downloads/disk_optimizer_demo`.
+- Set `DISK_OPTIMIZER_ROOT` to use another dedicated demo folder.
+- Paths outside the configured folder, symbolic links, and non-files are rejected.
+- The LLM cannot approve its own deletion. `agentic_shell.py` displays the selected paths and sizes, then requires the user to type `DELETE` before it calls `delete_files`.
+- The MCP server revalidates every path before removal and runs fixed Linux utilities without passing user text to a shell.
 
 ## Requirements
 
-- Linux (for `df`, `du`, and `stat`)
+- Linux with `df`, `du`, and `stat`
 - Python 3.11 or newer
-- The MCP Python SDK and CLI
+- Ollama with the `qwen3:0.6b` model
 
-## Install
+## Install and prepare the demo
 
 From the project folder in Ubuntu:
 
@@ -42,25 +51,29 @@ From the project folder in Ubuntu:
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
+ollama pull qwen3:0.6b
 mkdir -p "$HOME/Downloads/disk_optimizer_demo"
+python3 agentic_shell.py --setup-demo
 ```
 
-To use another folder, set its path before starting the MCP host:
+If Ollama is not already running, start it in a separate terminal with `ollama serve`.
+
+## Run
 
 ```bash
-export DISK_OPTIMIZER_ROOT="$HOME/Downloads/disk_optimizer_demo"
+source .venv/bin/activate
+python3 agentic_shell.py
 ```
 
-## Connect to an MCP host
+Try these requests:
 
-This is an MCP server, not a standalone interactive shell. Configure your MCP host to launch `disk_optimizer_server.py` with the Python interpreter from this project's `.venv`. The server communicates over standard input and output and normally waits quietly for the host; the host provides the LLM, routes requests, and displays tool results and approval prompts.
-
-Example launch command from this folder:
-
-```bash
-./.venv/bin/python disk_optimizer_server.py
+```text
+Find text files older than 30 days and show their total size. Do not delete anything.
+Delete old_notes.txt from the demo folder.
 ```
+
+For the second request, the host shows the exact file and size. Type `DELETE` to approve or anything else to cancel.
 
 ## Project scope
 
-This repository contains the Disk Optimizer specialist MCP server. It is designed to connect to the larger Agentic Shell described in the project architecture; it does not implement the shell's full router for all 35 agents.
+`agentic_shell.py` demonstrates the LLM-to-MCP flow for this one specialist agent. The full class Agentic Shell router for all 35 agents is outside this repository. `diskopti_cli.py` is an earlier standalone CLI demo and does not use the LLM-to-MCP flow.
